@@ -357,17 +357,13 @@ def intersect_intervals(a: list, b: list) -> list:
     return out
 
 
-def verify(ev: Evidence, tgt_a: dict, tgt_b: dict) -> dict:
-    """主流程:装载快照 -> 在起点比对 -> 逐事务重放并在每个提交点比对。"""
-    eng = Engine(tgt_a, tgt_b)
-    eng.load_snapshot(ev.wb_rows, ev.rc_rows)
+def replay(ev: Evidence, eng: Engine, on_commit) -> None:
+    """按证据包重放整份日志,在每个比对点(起点与每笔事务完成后)调用 on_commit。
 
-    match_a, match_b = [], []
-    if eng.mism_a == 0:
-        match_a.append(ev.start_commit)
-    if eng.mism_b == 0:
-        match_b.append(ev.start_commit)
-
+    日志缺号、乱序、越界或变更前值对不上时抛 EvidenceError。on_commit 只做只读
+    观察,不得修改 eng。
+    """
+    on_commit(ev.start_commit)
     expected = ev.start_commit + 1
     for tx in ev.transactions:
         if tx.commit != expected:
@@ -378,15 +374,61 @@ def verify(ev: Evidence, tgt_a: dict, tgt_b: dict) -> dict:
                 f"日志缺号: 提交号 {tx.commit} 超出终止提交号 {ev.end_commit}")
         for idx, ch in enumerate(tx.changes):
             eng.apply_change(ch, f"提交 {tx.commit} 第 {idx + 1} 条变更")
-        if eng.mism_a == 0:
-            match_a.append(tx.commit)
-        if eng.mism_b == 0:
-            match_b.append(tx.commit)
+        on_commit(tx.commit)
         expected += 1
 
     if expected != ev.end_commit + 1:
         raise EvidenceError(
             f"日志缺号: 缺少提交 {expected}..{ev.end_commit} 的记录")
+
+
+def replay_export_view(ev: Evidence, commit: int) -> dict:
+    """重放整份证据包(完整校验),返回指定提交完成后的导出视图与整表状态。
+
+    返回 {"waybills": 导出视图, "receipts": 导出视图,
+          "waybills_table": 运单整表, "receipts_table": 签收整表}:
+      导出视图 waybills: 单号 -> (状态, 件数),仅已签收运单;
+      导出视图 receipts: 签收号 -> (单号, 实收件数),仅所属运单已签收的签收行。
+    commit 允许等于起始提交号,此时取起点快照。
+    """
+    if not isinstance(commit, int) or isinstance(commit, bool):
+        raise InputError(f"目标提交号必须是整数,实际为 {commit!r}")
+    if commit < ev.start_commit or commit > ev.end_commit:
+        raise InputError(
+            f"目标提交号 {commit} 不在证据范围内 "
+            f"{ev.start_commit}..{ev.end_commit}")
+
+    eng = Engine({}, {})
+    eng.load_snapshot(ev.wb_rows, ev.rc_rows)
+    captured = {}
+
+    def on_commit(c):
+        if c == commit and c not in captured:
+            captured[c] = {
+                "waybills": dict(eng.current_view_a()),
+                "receipts": dict(eng.current_view_b()),
+                "waybills_table": dict(eng.waybills),
+                "receipts_table": dict(eng.receipts),
+            }
+
+    replay(ev, eng, on_commit)
+    return captured[commit]
+
+
+def verify(ev: Evidence, tgt_a: dict, tgt_b: dict) -> dict:
+    """主流程:装载快照 -> 在起点比对 -> 逐事务重放并在每个提交点比对。"""
+    eng = Engine(tgt_a, tgt_b)
+    eng.load_snapshot(ev.wb_rows, ev.rc_rows)
+
+    match_a, match_b = [], []
+
+    def on_commit(c):
+        if eng.mism_a == 0:
+            match_a.append(c)
+        if eng.mism_b == 0:
+            match_b.append(c)
+
+    replay(ev, eng, on_commit)
 
     iv_a = to_intervals(match_a)
     iv_b = to_intervals(match_b)
@@ -404,7 +446,8 @@ def verify(ev: Evidence, tgt_a: dict, tgt_b: dict) -> dict:
 
 # ---- CSV 读取 ----
 
-def _read_csv_rows(raw: bytes, required_cols, key_col, what: str) -> dict:
+def _read_csv_rows(raw: bytes, required_cols, key_col, what: str,
+                   require_rows: bool = True) -> dict:
     import csv
     import io
 
@@ -432,7 +475,7 @@ def _read_csv_rows(raw: bytes, required_cols, key_col, what: str) -> dict:
         if key in out:
             raise InputError(f"{what} 第 {ln} 行键 {key} 重复")
         out[key] = tuple((row.get(colmap[c]) or "") for c in required_cols if c != key_col)
-    if not out:
+    if require_rows and not out:
         raise InputError(f"{what} 没有任何数据行")
     return out
 
@@ -445,3 +488,15 @@ def load_waybill_csv(raw: bytes) -> dict:
 def load_receipt_csv(raw: bytes) -> dict:
     """签收导出 CSV -> {签收号: (单号, 实收件数)}"""
     return _read_csv_rows(raw, (RC_KEY,) + RC_VALUE_COLS, RC_KEY, "签收 CSV")
+
+
+def load_waybill_csv_allow_empty(raw: bytes) -> dict:
+    """回补用:与 load_waybill_csv 相同,但允许只有表头、没有数据行。"""
+    return _read_csv_rows(raw, (WB_KEY,) + WB_VALUE_COLS, WB_KEY, "运单 CSV",
+                          require_rows=False)
+
+
+def load_receipt_csv_allow_empty(raw: bytes) -> dict:
+    """回补用:与 load_receipt_csv 相同,但允许只有表头、没有数据行。"""
+    return _read_csv_rows(raw, (RC_KEY,) + RC_VALUE_COLS, RC_KEY, "签收 CSV",
+                          require_rows=False)

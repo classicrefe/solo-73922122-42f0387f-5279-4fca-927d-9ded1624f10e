@@ -6,15 +6,30 @@ import json
 import random
 import sys
 import time
+import base64
+import io
+import zipfile
 
 from app.core import (
     EvidenceError,
     InputError,
     load_receipt_csv,
+    load_receipt_csv_allow_empty,
     load_waybill_csv,
+    load_waybill_csv_allow_empty,
     parse_evidence,
     verify,
 )
+from app.backfill import (
+    CannotProduce,
+    ScopeInsufficient,
+    build_output,
+    compute_scope,
+    parse_approved,
+    parse_target_commit,
+    run_backfill,
+)
+from app.backfill_sample import build_backfill_sample
 from app.sample import build_sample
 
 FAILED = []
@@ -233,6 +248,235 @@ def t_perf_50k():
     check("性能可接受(<20s)", dt < 20, f"{dt:.2f}s")
 
 
+def _backfill_inputs():
+    ev_dict, wb_csv, rc_csv, demo = build_backfill_sample()
+    ev = parse_evidence(json.loads(json.dumps(ev_dict)))
+    cur_a = load_waybill_csv_allow_empty(wb_csv.encode())
+    cur_b = load_receipt_csv_allow_empty(rc_csv.encode())
+    return ev, cur_a, cur_b, demo
+
+
+def _zip_rows(result):
+    raw = base64.b64decode(result["package"]["content_base64"])
+    zf = zipfile.ZipFile(io.BytesIO(raw))
+    out = {}
+    for name in ("waybills.csv", "receipts.csv"):
+        text = zf.read(name).decode("utf-8-sig")
+        reader = __import__("csv").DictReader(io.StringIO(text))
+        out[name] = {row[reader.fieldnames[0]]: tuple(row[c] for c in reader.fieldnames[1:])
+                     for row in reader}
+    return zf, out
+
+
+def t_backfill_sample():
+    print("== 回补:样例闭包、目标版替换与 ZIP 内容")
+    ev, cur_a, cur_b, demo = _backfill_inputs()
+    tgt = 505
+
+    r = run_backfill(ev, cur_a, cur_b, tgt, demo["approved"])
+    check("回补成功", r["status"] == "ok", r.get("message", ""))
+    check("闭包=获准范围", r["scope"]["required"] == demo["approved"],
+          str(r["scope"]["required"]))
+    zf, rows = _zip_rows(r)
+    check("ZIP 仅含两份 CSV", sorted(zf.namelist()) == ["receipts.csv", "waybills.csv"],
+          str(zf.namelist()))
+    check("运单 CSV 表头沿用导出列",
+          zf.read("waybills.csv").decode("utf-8-sig").splitlines()[0] == "单号,状态,件数")
+    check("签收 CSV 表头沿用导出列",
+          zf.read("receipts.csv").decode("utf-8-sig").splitlines()[0] == "签收号,单号,实收件数")
+    check("运单数据(目标版删除 WB101、范围外保留)",
+          rows["waybills.csv"] == demo["expected_waybills"], str(rows["waybills.csv"]))
+    check("签收数据(改挂落位、删除 RC1001、范围外保留)",
+          rows["receipts.csv"] == demo["expected_receipts"], str(rows["receipts.csv"]))
+
+    # 只获准 WB100 -> 必须提示补选 WB101 与签收号 RC1002
+    try:
+        run_backfill(ev, cur_a, cur_b, tgt, demo["under_scope"])
+        check("范围不足时拒绝出包", False, "未抛出 ScopeInsufficient")
+    except ScopeInsufficient as e:
+        s = e.scope["scope"]
+        check("范围不足:列出最少补选单号",
+              s["missing"] == demo["under_scope_missing"], str(s["missing"]))
+        check("范围不足:列出涉及签收号",
+              s["uncovered"][0]["涉及签收号"] == demo["under_scope_receipts"],
+              str(s["uncovered"]))
+        check("范围不足:结果不含 package", "package" not in e.scope)
+
+    # 起点快照也可作为目标:该票本无变化
+    r0 = run_backfill(ev, cur_a, cur_b, 500, ["WB100"])
+    check("目标=起点快照可用且无变更",
+          r0["status"] == "ok" and r0["stats"]["waybills"]["total_changed"] == 0
+          and r0["stats"]["receipts"]["total_changed"] == 0,
+          str(r0["stats"]))
+
+    # 目标版新增的运单也可作为获准对象
+    r3 = run_backfill(ev, cur_a, cur_b, tgt, ["WB103"])
+    _, rows3 = _zip_rows(r3)
+    check("目标版新增运单被引入",
+          rows3["waybills.csv"].get("WB103") == ("已签收", "1")
+          and rows3["receipts.csv"].get("RC1004") == ("WB103", "1"),
+          str(rows3["waybills.csv"].get("WB103")))
+
+    # 输出编码/换行跟随下游原文件
+    zf_lf = zipfile.ZipFile(io.BytesIO(base64.b64decode(
+        run_backfill(ev, cur_a, cur_b, tgt, demo["approved"])["package"]["content_base64"])))
+    w_lf = zf_lf.read("waybills.csv")
+    check("原文件无 BOM/LF -> 输出一致", not w_lf.startswith(b"\xef\xbb\xbf") and b"\r\n" not in w_lf)
+    r_bom = run_backfill(ev, cur_a, cur_b, tgt, demo["approved"],
+                         {"bom": True, "crlf": True})
+    w_bom = zipfile.ZipFile(io.BytesIO(base64.b64decode(
+        r_bom["package"]["content_base64"]))).read("waybills.csv")
+    check("原文件有 BOM/CRLF -> 输出一致",
+          w_bom.startswith(b"\xef\xbb\xbf") and b"\r\n" in w_bom)
+
+
+def t_backfill_multihop():
+    print("== 回补:多跳闭包(改挂链)与闭包细节")
+    tgt_a = {"A": ("已签收", "1"), "B": ("已签收", "1"), "C": ("已签收", "1")}
+    tgt_b = {"R1": ("B", "1"), "R2": ("C", "1")}
+    cur_a = {"A": ("已签收", "1"), "B": ("已签收", "1"), "C": ("已签收", "1")}
+    cur_b = {"R1": ("A", "1"), "R2": ("B", "1")}
+    sc = compute_scope(["A"], cur_a, cur_b, tgt_a, tgt_b)
+    check("改挂链 A->R1->B->R2->C 全闭包",
+          sc["required"] == ["A", "B", "C"] and sc["missing"] == ["B", "C"],
+          f"{sc['required']} missing={sc['missing']}")
+    by_wb = {u["单号"]: u for u in sc["uncovered"]}
+    check("B 的关联签收号(R1 连 A、R2 连 C)", by_wb["B"]["涉及签收号"] == ["R1", "R2"],
+          str(by_wb["B"]["涉及签收号"]))
+    check("C 的关联签收号", by_wb["C"]["涉及签收号"] == ["R2"],
+          str(by_wb["C"]["涉及签收号"]))
+
+    sc2 = compute_scope(["A", "B", "C"], cur_a, cur_b, tgt_a, tgt_b)
+    check("闭包全部获准即覆盖", sc2["covered"] and not sc2["missing"])
+
+    out_a, out_b = build_output({"A", "B", "C"}, cur_a, cur_b, tgt_a, tgt_b)
+    check("范围内整体取目标版", out_a == tgt_a and out_b == tgt_b,
+          f"{out_a} {out_b}")
+    extra_a = dict(cur_a, D=("已签收", "1"))
+    extra_b = dict(cur_b, R9=("D", "1"))
+    out_a2, out_b2 = build_output({"A"}, extra_a, extra_b, tgt_a, tgt_b)
+    check("范围外保留旧值", out_a2["D"] == ("已签收", "1")
+          and out_b2["R9"] == ("D", "1"), f"{out_a2} {out_b2}")
+
+
+def t_backfill_gates():
+    print("== 回补:出包前置校验")
+    ev, cur_a, cur_b, demo = _backfill_inputs()
+
+    # 下游存在无对应运单的签收行 -> 拒绝出包
+    bad_b = dict(cur_b)
+    bad_b["RC9999"] = ("WB999", "1")
+    try:
+        run_backfill(ev, cur_a, bad_b, 505, demo["approved"])
+        check("签收无运单时拒绝出包", False, "未抛出 CannotProduce")
+    except CannotProduce as e:
+        check("签收无运单时拒绝出包",
+              e.violations and e.violations[0]["签收号"] == "RC9999",
+              str(e.violations))
+        check("拒绝时结果不含 package", "package" not in e.result)
+
+    # 证据整份校验:任一提交缺号即停止,不出包
+    broken = json.loads(json.dumps(build_backfill_sample()[0]))
+    broken["transactions"] = [t for t in broken["transactions"] if t["commit"] != 504]
+    ev_bad = parse_evidence(broken)
+    expect_evidence_error("回补前完整校验证据(缺号)",
+                          lambda: run_backfill(ev_bad, cur_a, cur_b, 505,
+                                               demo["approved"]), "日志缺号")
+
+    # 目标提交越界
+    try:
+        run_backfill(ev, cur_a, cur_b, 999, demo["approved"])
+        check("目标提交越界报错", False, "未抛出 InputError")
+    except InputError as e:
+        check("目标提交越界报错", "不在证据范围内" in str(e), str(e))
+
+    # 获准单号不存在
+    try:
+        run_backfill(ev, cur_a, cur_b, 505, ["NOPE"])
+        check("未知获准单号报错", False, "未抛出 InputError")
+    except InputError as e:
+        check("未知获准单号报错", "NOPE" in str(e), str(e))
+
+    # 目标提交时已退出导出、但整表仍存在的运单可获准(按整票删除处理)
+    r = run_backfill(ev, cur_a, cur_b, 505, ["WB102"])
+    check("目标版退出的运单可按目标版删除",
+          r["scope"]["approved_no_rows"] == []
+          and r["stats"]["waybills"]["removed"] == ["WB102"]
+          and r["stats"]["receipts"]["removed"] == ["RC1003"], str(r["stats"]))
+
+    check("获准单号解析", parse_approved(" WB100，WB101; WB102\nWB100 ") ==
+          ["WB100", "WB101", "WB102"], str(parse_approved("WB100,WB101")))
+    check("目标提交号解析", parse_target_commit(" 505 ") == 505)
+    try:
+        parse_target_commit("505x")
+        check("非法目标提交号报错", False)
+    except InputError:
+        check("非法目标提交号报错", True)
+
+    # 空导出(只有表头)也能回补
+    r = run_backfill(ev, {}, {}, 505, ["WB100"])
+    check("空下游导出可回补", r["status"] == "ok"
+          and r["stats"]["waybills"]["added"] == ["WB100"]
+          and r["stats"]["receipts"]["added"] == ["RC1000", "RC1002"], str(r["stats"]))
+
+
+def t_backfill_http():
+    print("== 回补 HTTP 接口(TestClient)")
+    try:
+        from fastapi.testclient import TestClient
+        from app.main import app
+    except Exception as e:  # noqa: BLE001
+        print(f"  [SKIP] fastapi 不可用: {e}")
+        return
+    client = TestClient(app)
+    ev, wb_csv, rc_csv, demo = build_backfill_sample()
+    files = {
+        "waybill_csv": ("w.csv", wb_csv.encode(), "text/csv"),
+        "receipt_csv": ("r.csv", rc_csv.encode(), "text/csv"),
+        "evidence": ("e.json", json.dumps(ev, ensure_ascii=False).encode(),
+                     "application/json"),
+    }
+    resp = client.post("/api/backfill", files=files,
+                       data={"target_commit": "505",
+                             "approved": "WB100, WB101"})
+    body = resp.json()
+    check("回补接口 200 ok", resp.status_code == 200 and body["status"] == "ok",
+          f"{resp.status_code} {body.get('status')}")
+    check("回补接口返回 ZIP(base64)",
+          body["package"]["filename"] == "backfill_505.zip"
+          and base64.b64decode(body["package"]["content_base64"])[:2] == b"PK")
+
+    resp2 = client.post("/api/backfill", files=files,
+                        data={"target_commit": "505", "approved": "WB100"})
+    b2 = resp2.json()
+    check("范围不足 409 + 补选清单",
+          resp2.status_code == 409 and b2["status"] == "insufficient_scope"
+          and b2["scope"]["missing"] == ["WB101"], str(b2)[:200])
+
+    resp3 = client.post("/api/backfill", files=files,
+                        data={"target_commit": "999", "approved": "WB100"})
+    check("目标越界 400", resp3.status_code == 400
+          and resp3.json()["status"] == "invalid_input", str(resp3.status_code))
+
+    resp4 = client.post("/api/backfill", files=files,
+                        data={"target_commit": "505", "approved": "  "})
+    check("空获准范围 400", resp4.status_code == 400, str(resp4.status_code))
+
+    files5 = dict(files)
+    files5["evidence"] = ("e.json", b"{not json", "application/json")
+    resp5 = client.post("/api/backfill", files=files5,
+                        data={"target_commit": "505", "approved": "WB100"})
+    check("坏证据包 400", resp5.status_code == 400, str(resp5.status_code))
+
+    page = client.get("/")
+    check("页面含回补入口", "运单回补" in page.text and "/api/backfill" in page.text)
+    for path in ("/api/backfill/sample/waybills.csv",
+                 "/api/backfill/sample/receipts.csv",
+                 "/api/backfill/sample/evidence.json"):
+        r = client.get(path)
+        check(f"回补样例可下载 {path}", r.status_code == 200, str(r.status_code))
+
+
 def t_http():
     print("== HTTP 接口(TestClient)")
     try:
@@ -287,7 +531,11 @@ def main():
     t_receipt_retarget()
     t_csv_validation()
     t_perf_50k()
+    t_backfill_sample()
+    t_backfill_multihop()
+    t_backfill_gates()
     t_http()
+    t_backfill_http()
     print()
     if FAILED:
         print(f"失败 {len(FAILED)} 项: {', '.join(FAILED)}")
